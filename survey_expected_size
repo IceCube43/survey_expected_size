@@ -1,59 +1,340 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+main3.py — create tenor-specific survey_expected_size for Treasury bill announcements.
+
+Usage:
+  python main3.py --in_csv cmb_output_with_announced_size.csv \
+                  --out_csv issuance_with_survey_expected.csv \
+                  --window 4
+"""
 
 import argparse
+import re
+from typing import Optional, Tuple, List
+
 import numpy as np
 import pandas as pd
 
-def build_survey_expected_inplace(csv_in: str, csv_out: str = None, window: int = 4) -> None:
+
+# ---------------------------
+# Generic helpers
+# ---------------------------
+
+def _to_datetime(s: pd.Series) -> pd.Series:
+    return pd.to_datetime(s, errors='coerce', utc=False).dt.tz_localize(None)
+
+def _num_simple(s: pd.Series) -> pd.Series:
+    """Simple numeric coercion after removing commas/$/spaces."""
+    if s.dtype == object:
+        s = s.astype(str).str.replace(r'[,\$\s]', '', regex=True)
+    return pd.to_numeric(s, errors='coerce')
+
+
+# ---------------------------
+# Date detection
+# ---------------------------
+
+def _extract_announce_date_from_url(series: pd.Series) -> pd.Series:
+    """Extract YYYYMMDD from TreasuryDirect-style names in a URL/path, e.g. .../A_20250918_1.xml."""
+    pat = re.compile(r'[\\/_]A_(\d{8})[_.]', flags=re.IGNORECASE)
+    def _one(x):
+        if not isinstance(x, str):
+            return pd.NaT
+        m = pat.search(x)
+        if not m:
+            return pd.NaT
+        ymd = m.group(1)
+        try:
+            return pd.to_datetime(ymd, format="%Y%m%d")
+        except Exception:
+            return pd.NaT
+    return series.apply(_one)
+
+def _get_announce_date(df: pd.DataFrame) -> pd.Series:
+    # 1) explicit variants
+    explicit = [
+        'announce_date','AnnouncementDate','announcement_date','date',
+        'Announcement Date','AnnounceDate','Announce Date','Announce_Date',
+        'announce-date','announced_date','AnnouncedDate','Announced Date'
+    ]
+    for c in explicit:
+        if c in df.columns:
+            s = _to_datetime(df[c])
+            if s.notna().any():
+                return s.rename('announce_date')
+
+    # 2) fuzzy name normalization
+    norm_map = { re.sub(r'[^a-z]', '', c.lower()): c for c in df.columns }
+    for key in ['announcedate','announcementdate','announceddate','announcedate']:
+        if key in norm_map:
+            s = _to_datetime(df[norm_map[key]])
+            if s.notna().any():
+                return s.rename('announce_date')
+
+    # 3) extract from URL-like fields
+    url_like_cols = [
+        'announcement_xml_url','xml_url','download_url','announcement_url',
+        'xml','XML','AnnouncementXML','announcementXML','AnnouncementXmlURL'
+    ]
+    for c in url_like_cols:
+        if c in df.columns:
+            s = _extract_announce_date_from_url(df[c])
+            if s.notna().any():
+                return s.rename('announce_date')
+
+    raise KeyError(
+        "Could not determine announcement date. Tried common header variants and URL parsing. "
+        f"Available columns: {list(df.columns)}"
+    )
+
+
+# ---------------------------
+# Security type detection
+# ---------------------------
+
+def _normalize_security_type(df: pd.DataFrame) -> pd.Series:
+    # base
+    st = None
+    for c in ['security_type', 'SecurityType', 'type']:
+        if c in df.columns:
+            st = df[c].astype(str).str.upper().str.strip()
+            break
+    if st is None:
+        st = pd.Series('BILL', index=df.index, dtype=object)
+
+    # generic CMB flags
+    cmb_flags = []
+    for c in ['is_cmb', 'cmb', 'cash_management_bill', 'CashManagementBill', 'IsCMB']:
+        if c in df.columns:
+            f = df[c]
+            if f.dtype == object:
+                f = f.astype(str).str.strip().str.upper().isin(['1','Y','YES','TRUE','T'])
+            else:
+                f = f.astype('boolean', copy=False).fillna(False)
+            cmb_flags.append(f)
+
+    # Treasury*Accepted: 'N' => CMB
+    for c in ['TreasuryRetailTenderAccepted', 'TreasuryDirectTenderAccepted']:
+        if c in df.columns:
+            f = df[c].astype(str).str.strip().str.upper()
+            cmb_flags.append(f.eq('N'))
+
+    if cmb_flags:
+        any_cmb = np.column_stack([f.values for f in cmb_flags]).any(axis=1)
+        st = np.where(any_cmb, 'CMB', st)
+
+    st = pd.Series(st, index=df.index).where(pd.Series(st).isin(['BILL','CMB']), 'BILL')
+    return st
+
+
+# ---------------------------
+# Tenor parsing
+# ---------------------------
+
+def _weeks_from_text(x: str) -> Optional[float]:
+    if not isinstance(x, str):
+        return None
+    s = x.strip().upper()
+
+    # composite YEAR + MONTH (e.g., "19-YEAR 10-MONTH")
+    m_y = re.search(r'(\d+)\s*-\s*YEAR', s)
+    m_m = re.search(r'(\d+)\s*-\s*MONTH', s)
+    y = float(m_y.group(1)) if m_y else None
+    mo = float(m_m.group(1)) if m_m else None
+    if y is not None or mo is not None:
+        y = y or 0.0
+        mo = mo or 0.0
+        return round(y * 52.0 + mo * 4.345, 1)
+
+    try:
+        if 'WEEK' in s:
+            n = float(s.split('-')[0])
+            return n
+        if 'DAY' in s:
+            n = float(s.split('-')[0])
+            return n / 7.0
+        if 'MONTH' in s:
+            n = float(s.split('-')[0])
+            return round(n * 4.345, 1)
+        if 'YEAR' in s:
+            n = float(s.split('-')[0])
+            return n * 52.0
+    except Exception:
+        return None
+    return None
+
+def _build_tenor_weeks(df: pd.DataFrame) -> pd.Series:
+    # 1) existing numeric
+    for c in ['tenor_weeks', 'TenorWeeks', 'tenor_week', 'tenor', 'Tenor']:
+        if c in df.columns:
+            tw = _num_simple(df[c])
+            if tw.notna().any():
+                break
+    else:
+        # 2) parse textual fields
+        candidates = []
+        for c in ['SecurityTermWeekYear', 'SecurityTermDayMonth', 'SecurityTerm',
+                  'security_term_desc', 'security_term']:
+            if c in df.columns:
+                candidates.append(df[c].astype(str))
+        if candidates:
+            tmp = pd.DataFrame({f'c{i}': s for i, s in enumerate(candidates)})
+            parsed = tmp.applymap(_weeks_from_text)
+            tw = parsed.bfill(axis=1).iloc[:, 0]
+        else:
+            tw = pd.Series(np.nan, index=df.index)
+
+    # snap near-integers to integers
+    tw_int = tw.round().where((tw - tw.round()).abs() <= 0.2, tw)
+    return pd.to_numeric(tw_int, errors='coerce')
+
+
+# ---------------------------
+# Announced size detection + parsing to billions
+# ---------------------------
+
+_NEGATIVE_TOKENS = {'accept', 'accepted', 'totalaccepted', 'awarded', 'allocated'}
+_POSITIVE_TOKENS = [
+    'announcedsize', 'announced_amount', 'announced', 'offeringamount',
+    'amountoffered', 'offeredamount', 'offersize', 'offeringsize', 'size', 'offer'
+]
+
+def _candidate_size_columns(df: pd.DataFrame) -> List[str]:
+    """Return candidate columns ranked by plausibility, ignoring 'accepted' fields."""
+    # 1) explicit, common headers (case/space variants included)
+    explicit = [
+        'announced_size','Announced Size','AnnouncedSize',
+        'OfferingAmount','Offering Amount','offering_amount',
+        'OfferSize','Offer Size',
+        'AmountOffered','Amount Offered','OfferedAmount','Offered Amount',
+        'TotalOfferingAmount','Total Offering Amount',
+        'Size','size'
+    ]
+    cand = [c for c in explicit if c in df.columns]
+
+    # 2) fuzzy search on normalized names
+    norm = { re.sub(r'[^a-z]', '', c.lower()): c for c in df.columns }
+    for key, col in norm.items():
+        if any(tok in key for tok in _NEGATIVE_TOKENS):
+            continue
+        if any(tok in key for tok in _POSITIVE_TOKENS):
+            if col not in cand:
+                cand.append(col)
+
+    # Keep columns with some numeric signal
+    good = []
+    for c in cand:
+        s = df[c]
+        nn = _num_simple(s).notna().mean()
+        if nn >= 0.05:  # ≥5% parsable as number
+            good.append(c)
+    return good
+
+_SUFFIX_RE = re.compile(
+    r'^\s*([+-]?\d{1,3}(?:,\d{3})*|\d+)(?:\.(\d+))?\s*([bB]|BN|BILLION|MM|M|MILLION)?\s*$',
+    flags=re.IGNORECASE
+)
+
+def _parse_moneylike_to_billions(series: pd.Series) -> pd.Series:
+    """Parse '50B', '75 bn', '12,000 m', '25MM', '$5.5 billion' into billions."""
+    if series.dtype != object:
+        return _num_simple(series)
+
+    def _one(x):
+        if x is None:
+            return np.nan
+        s = str(x).strip().replace('$', '')
+        m = _SUFFIX_RE.match(s)
+        if not m:
+            s2 = re.sub(r'[^\d\.\,\-\+]', '', s)
+            try:
+                return float(s2.replace(',', ''))
+            except Exception:
+                return np.nan
+        intpart, frac, suf = m.group(1), m.group(2), m.group(3)
+        val = float((intpart or '0').replace(',', ''))
+        if frac:
+            val += float('0.' + frac)
+        if not suf:
+            return val  # units unknown; heuristic later
+        suf = suf.upper()
+        if suf in {'B', 'BN', 'BILLION'}:
+            return val
+        if suf in {'M', 'MM', 'MILLION'}:
+            return val / 1000.0
+        return val
+
+    return series.apply(_one)
+
+def _to_billions(x: pd.Series) -> Tuple[pd.Series, str]:
+    """
+    Coerce a money-like column to billions using suffix parsing and a fallback heuristic.
+    Heuristic: if median is in [1,000, 1,000,000) -> treat as millions and divide by 1,000.
+    """
+    y = _parse_moneylike_to_billions(x)
+    med = y.median(skipna=True)
+    if pd.isna(med):
+        return y, "unchanged (unknown units)"
+    if 1_000 <= med < 1_000_000:
+        return y / 1_000.0, "converted from millions → billions (÷1,000)"
+    return y, "already in billions (or smaller units not detected)"
+
+
+# ---------------------------
+# Core computation
+# ---------------------------
+
+def add_survey_expected_size(csv_in: str, csv_out: Optional[str] = None, window: int = 4) -> None:
     df = pd.read_csv(csv_in)
+    df.insert(0, '_orig_order', np.arange(len(df)))  # preserve original order
 
-    # Column picks (no new columns are created besides overwriting/creating survey_expected_size)
-    date_col  = 'announce_date'
-    type_col  = 'security_type'
-    tenor_col = 'tenor_weeks' if 'tenor_weeks' in df.columns else 'tenor_week'
-    size_col  = 'announced_size' if 'announced_size' in df.columns else 'announced_size_bn'
+    # 1) announce_date
+    df['announce_date'] = _get_announce_date(df)
 
-    # Basic validations (fail fast with clear message)
-    missing = [c for c in [date_col, type_col, tenor_col, size_col] if c not in df.columns]
-    if missing:
-        raise KeyError(f"Missing required columns: {missing}. "
-                       f"Needed one of tenor_weeks/tenor_week and one of announced_size/announced_size_bn.")
+    # 2) security type
+    df['security_type'] = _normalize_security_type(df)
 
-    # Types
-    df[date_col]  = pd.to_datetime(df[date_col], errors='coerce')
-    df[type_col]  = df[type_col].astype(str).str.upper().str.strip()
-    df[tenor_col] = pd.to_numeric(df[tenor_col], errors='coerce')
-    df[size_col]  = pd.to_numeric(df[size_col], errors='coerce')
+    # 3) tenor weeks
+    df['tenor_weeks'] = _build_tenor_weeks(df)
 
-    # Work on a sorted view for time-ordered rolling operations (no extra columns persist)
-    order = np.arange(len(df))  # keep original row order for final write
-    d = df.loc[:, [date_col, type_col, tenor_col, size_col]].copy()
-    d['_idx_'] = order
-    d = d.sort_values([type_col, tenor_col, date_col])
+    # 4) announced size (robust column discovery)
+    size_col = None
+    for c in _candidate_size_columns(df):
+        size_col = c
+        break
+    if size_col is None:
+        raise KeyError(
+            "Could not find an announced size column. "
+            "Tried explicit and fuzzy matches for offering/size fields and ignored 'accepted' fields. "
+            f"Available columns: {list(df.columns)}"
+        )
+    df['announced_size'], note_units = _to_billions(df[size_col])
 
-    # Initialize the only target column (in the view)
-    d['survey_expected_size'] = np.nan
+    # 5) compute survey_expected_size
+    # IMPORTANT: do NOT precreate df['survey_expected_size'] to avoid _x/_y suffixes later.
+    d = df.sort_values(['security_type', 'tenor_weeks', 'announce_date']).copy()
 
-    # BILLs with valid tenor
-    mask_bill = d[type_col].eq('BILL') & d[tenor_col].notna()
+    mask_bill = d['security_type'].eq('BILL') & d['tenor_weeks'].notna()
     bill_idx = d.index[mask_bill]
 
-    # (a) Tenor-specific rolling mean of prior 'window' announcements (past-only via shift)
+    # (a) tenor-specific rolling mean (past-only)
     roll = (
         d.loc[bill_idx]
-         .groupby(tenor_col)[size_col]
-         .rolling(window=window, min_periods=1).mean()
+         .groupby(['tenor_weeks'])['announced_size']
+         .rolling(window=window, min_periods=1)
+         .mean()
          .shift(1)
          .reset_index(level=0, drop=True)
     )
     d.loc[bill_idx, 'survey_expected_size'] = roll
 
-    # (b) Tenor-specific expanding median (past-only) for remaining NaNs among BILLs
+    # (b) tenor-specific expanding median (past-only)
     fill_med = (
         d.loc[bill_idx]
-         .groupby(tenor_col)[size_col]
-         .expanding(min_periods=1).median()
+         .groupby('tenor_weeks')['announced_size']
+         .expanding(min_periods=1)
+         .median()
          .shift(1)
          .reset_index(level=0, drop=True)
     )
@@ -61,25 +342,59 @@ def build_survey_expected_inplace(csv_in: str, csv_out: str = None, window: int 
     d.loc[need_fill, 'survey_expected_size'] = fill_med.loc[need_fill]
 
     # (c) CMBs default to zero
-    mask_cmb_missing = d[type_col].eq('CMB') & d['survey_expected_size'].isna()
+    mask_cmb_missing = d['security_type'].eq('CMB') & d['survey_expected_size'].isna()
     d.loc[mask_cmb_missing, 'survey_expected_size'] = 0.0
 
-    # (d) Overall expanding median (past-only), then 0.0
-    overall_med = d[size_col].expanding(min_periods=1).median().shift(1)
+    # (d) overall expanding median (past-only), then 0.0
+    overall_med = d['announced_size'].expanding(min_periods=1).median().shift(1)
     d['survey_expected_size'] = d['survey_expected_size'].fillna(overall_med).fillna(0.0)
 
-    # Bring the single computed column back, preserving original order
-    d = d.sort_values('_idx_')
-    df['survey_expected_size'] = d['survey_expected_size'].to_numpy()
+    # Merge back WITHOUT suffixes; ensure the column exists afterwards.
+    df = df.merge(
+        d[['_orig_order', 'survey_expected_size']],
+        on='_orig_order',
+        how='left',
+        suffixes=('', '')  # <- key fix: avoid _x/_y
+    ).sort_values('_orig_order')
 
-    # Save (overwrite path or to a new file)
-    out = csv_out or csv_in
-    df.to_csv(out, index=False)
+    # Final normalization in case pandas still created suffixes in some edge envs
+    if 'survey_expected_size' not in df.columns:
+        # try to coalesce potential suffixed variants
+        cand = [c for c in df.columns if c.startswith('survey_expected_size')]
+        if cand:
+            df['survey_expected_size'] = df[cand[0]]
+            df.drop(columns=[c for c in cand if c != 'survey_expected_size'], inplace=True, errors='ignore')
+        else:
+            raise RuntimeError("Internal error: survey_expected_size missing after merge-back step.")
+
+    # QA "surprise"
+    df['surprise'] = df['announced_size'] - df['survey_expected_size']
+
+    # Save
+    out = csv_in.replace('.csv', '_with_survey_expected.csv') if csv_out is None else csv_out
+    df.drop(columns=['_orig_order'], errors='ignore').to_csv(out, index=False)
+
+    # Console summary
+    n = len(df)
+    n_cmb = int((df['security_type'] == 'CMB').sum())
+    n_bill = int((df['security_type'] == 'BILL').sum())
+    na_dates = int(df['announce_date'].isna().sum())
+    print(f"[done ] wrote: {out}")
+    print(f"[units] announced_size source column: '{size_col}' | normalization: {note_units}")
+    print(f"[rows ] total={n} | BILL={n_bill} | CMB={n_cmb} | announce_date NaT={na_dates}")
+    peek_cols = [c for c in ['announce_date','security_type','tenor_weeks',
+                             'announced_size','survey_expected_size','surprise'] if c in df.columns]
+    print(df[peek_cols].head(10))
+
+
+# ---------------------------
+# CLI
+# ---------------------------
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="Compute survey_expected_size in place (no extra columns).")
-    ap.add_argument("--in_csv", required=True, help="Input CSV path.")
-    ap.add_argument("--out_csv", default=None, help="Output CSV path (default: overwrite input).")
-    ap.add_argument("--window", type=int, default=4, help="Rolling window for BILL tenor means (default: 4).")
+    ap = argparse.ArgumentParser(description="Build tenor-specific survey_expected_size for issuance CSV.")
+    ap.add_argument("--in_csv", required=True, help="Path to issuance CSV (e.g., cmb_output_with_announced_size.csv)")
+    ap.add_argument("--out_csv", default=None, help="Optional output path; default appends _with_survey_expected.csv")
+    ap.add_argument("--window", type=int, default=4, help="Rolling window length for BILL expectations (default: 4)")
     args = ap.parse_args()
-    build_survey_expected_inplace(args.in_csv, args.out_csv, window=args.window)
+    add_survey_expected_size(args.in_csv, args.out_csv, window=args.window)
