@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import argparse
+import numpy as np
+import pandas as pd
+
+def build_survey_expected_inplace(csv_in: str, csv_out: str = None, window: int = 4) -> None:
+    df = pd.read_csv(csv_in)
+
+    # Column picks (no new columns are created besides overwriting/creating survey_expected_size)
+    date_col  = 'announce_date'
+    type_col  = 'security_type'
+    tenor_col = 'tenor_weeks' if 'tenor_weeks' in df.columns else 'tenor_week'
+    size_col  = 'announced_size' if 'announced_size' in df.columns else 'announced_size_bn'
+
+    # Basic validations (fail fast with clear message)
+    missing = [c for c in [date_col, type_col, tenor_col, size_col] if c not in df.columns]
+    if missing:
+        raise KeyError(f"Missing required columns: {missing}. "
+                       f"Needed one of tenor_weeks/tenor_week and one of announced_size/announced_size_bn.")
+
+    # Types
+    df[date_col]  = pd.to_datetime(df[date_col], errors='coerce')
+    df[type_col]  = df[type_col].astype(str).str.upper().str.strip()
+    df[tenor_col] = pd.to_numeric(df[tenor_col], errors='coerce')
+    df[size_col]  = pd.to_numeric(df[size_col], errors='coerce')
+
+    # Work on a sorted view for time-ordered rolling operations (no extra columns persist)
+    order = np.arange(len(df))  # keep original row order for final write
+    d = df.loc[:, [date_col, type_col, tenor_col, size_col]].copy()
+    d['_idx_'] = order
+    d = d.sort_values([type_col, tenor_col, date_col])
+
+    # Initialize the only target column (in the view)
+    d['survey_expected_size'] = np.nan
+
+    # BILLs with valid tenor
+    mask_bill = d[type_col].eq('BILL') & d[tenor_col].notna()
+    bill_idx = d.index[mask_bill]
+
+    # (a) Tenor-specific rolling mean of prior 'window' announcements (past-only via shift)
+    roll = (
+        d.loc[bill_idx]
+         .groupby(tenor_col)[size_col]
+         .rolling(window=window, min_periods=1).mean()
+         .shift(1)
+         .reset_index(level=0, drop=True)
+    )
+    d.loc[bill_idx, 'survey_expected_size'] = roll
+
+    # (b) Tenor-specific expanding median (past-only) for remaining NaNs among BILLs
+    fill_med = (
+        d.loc[bill_idx]
+         .groupby(tenor_col)[size_col]
+         .expanding(min_periods=1).median()
+         .shift(1)
+         .reset_index(level=0, drop=True)
+    )
+    need_fill = bill_idx[d.loc[bill_idx, 'survey_expected_size'].isna()]
+    d.loc[need_fill, 'survey_expected_size'] = fill_med.loc[need_fill]
+
+    # (c) CMBs default to zero
+    mask_cmb_missing = d[type_col].eq('CMB') & d['survey_expected_size'].isna()
+    d.loc[mask_cmb_missing, 'survey_expected_size'] = 0.0
+
+    # (d) Overall expanding median (past-only), then 0.0
+    overall_med = d[size_col].expanding(min_periods=1).median().shift(1)
+    d['survey_expected_size'] = d['survey_expected_size'].fillna(overall_med).fillna(0.0)
+
+    # Bring the single computed column back, preserving original order
+    d = d.sort_values('_idx_')
+    df['survey_expected_size'] = d['survey_expected_size'].to_numpy()
+
+    # Save (overwrite path or to a new file)
+    out = csv_out or csv_in
+    df.to_csv(out, index=False)
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description="Compute survey_expected_size in place (no extra columns).")
+    ap.add_argument("--in_csv", required=True, help="Input CSV path.")
+    ap.add_argument("--out_csv", default=None, help="Output CSV path (default: overwrite input).")
+    ap.add_argument("--window", type=int, default=4, help="Rolling window for BILL tenor means (default: 4).")
+    args = ap.parse_args()
+    build_survey_expected_inplace(args.in_csv, args.out_csv, window=args.window)
